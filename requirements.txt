@@ -1,7 +1,2 @@
 discord.py
-groq
 ollama
-flask
-flask-cors
-requests
-python-dotenv
