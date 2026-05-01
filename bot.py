@@ -15,17 +15,18 @@ from concurrent.futures import ThreadPoolExecutor
 # ====== loaded from environment variables ======
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gpt-oss:120b")  # default if not set
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gpt-oss:120b")
 CHANNEL_NAME = os.environ.get("CHANNEL_NAME", "nova")
 OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "aussieaviationbne")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 # ===============================================
 
-# check all required vars are set
 if not DISCORD_TOKEN:
-    print("[ERROR] DISCORD_TOKEN environment variable not set!")
+    print("[ERROR] DISCORD_TOKEN not set!")
     sys.exit(1)
 if not OLLAMA_API_KEY:
-    print("[ERROR] OLLAMA_API_KEY environment variable not set!")
+    print("[ERROR] OLLAMA_API_KEY not set!")
     sys.exit(1)
 
 intents = discord.Intents.all()
@@ -40,7 +41,6 @@ ollama_client = Client(
 )
 executor = ThreadPoolExecutor(max_workers=4)
 seen_messages = set()
-
 conversation_history = {}
 processing_users = set()
 
@@ -79,6 +79,46 @@ def ask_ollama(messages):
         messages=messages
     )
     return response.message.content.strip()
+
+# ====== Supabase sync ======
+def supabase(method, path, data=None):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return []
+    url = f"{SUPABASE_URL}/rest/v1/{path}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+    payload = json.dumps(data).encode("utf-8") if data else None
+    req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            body = r.read().decode("utf-8")
+            return json.loads(body) if body else []
+    except Exception as e:
+        print(f"[SUPABASE ERROR] {e}")
+        return []
+
+def sync_user(user_id, username, avatar=""):
+    supabase("POST", "users?on_conflict=id", {
+        "id": str(user_id),
+        "username": username,
+        "avatar": avatar,
+        "last_active": datetime.utcnow().isoformat()
+    })
+
+def sync_message(user_id, role, content):
+    supabase("POST", "messages", {
+        "user_id": str(user_id),
+        "role": role,
+        "content": content
+    })
+    supabase("PATCH", f"users?id=eq.{user_id}", {
+        "last_active": datetime.utcnow().isoformat()
+    })
+# ==========================
 
 def save_conversation(user_id, username, history):
     filepath = os.path.join(SAVE_DIR, f"{user_id}.json")
@@ -160,11 +200,9 @@ async def unban_user(message, target_username):
             if ban_entry.user.name.lower() == target_username.lower():
                 target = ban_entry.user
                 break
-
         if not target:
             await send_once(message.channel, f"❌ Couldn't find **{target_username}** in the ban list.")
             return
-
         nova_channel = discord.utils.get(guild.text_channels, name=CHANNEL_NAME)
         invite = None
         if nova_channel:
@@ -174,10 +212,8 @@ async def unban_user(message, target_username):
                 unique=True,
                 reason=f"One time invite for unbanned user {target.name}"
             )
-
         await guild.unban(target)
         log("NOVA", f"[UNBAN] {target.name} unbanned by {message.author.name}", "BOT")
-
         if invite:
             try:
                 dm = await target.create_dm()
@@ -195,7 +231,6 @@ async def unban_user(message, target_username):
                     f"Their DMs are closed — send them this invite manually:\n{invite.url}")
         else:
             await send_once(message.channel, f"✅ **{target.name}** has been unbanned.")
-
     except discord.Forbidden:
         await send_once(message.channel, "❌ I don't have permission to unban members.")
     except Exception as e:
@@ -266,14 +301,11 @@ async def on_message(message):
 
     if message.author.bot:
         return
-
     if message.author.system:
         return
-
     if message.id in seen_messages:
         return
     seen_messages.add(message.id)
-
     if len(seen_messages) > 1000:
         seen_messages.clear()
 
@@ -413,6 +445,10 @@ async def on_message(message):
 
         save_conversation(user_id, username, conversation_history[user_id])
 
+        # sync to supabase
+        sync_user(user_id, username)
+        sync_message(user_id, "user", user_text)
+
         async with message.channel.typing():
             loop = asyncio.get_event_loop()
             reply = await loop.run_in_executor(executor, ask_ollama, [
@@ -431,6 +467,7 @@ async def on_message(message):
                 image_data = await loop.run_in_executor(executor, download_image, image_url)
             await send_once(message.channel, file=discord.File(image_data, filename="nova.png"))
             conversation_history[user_id].append({"role": "assistant", "content": f"Generated image of: {image_prompt}"})
+            sync_message(user_id, "assistant", f"Generated image of: {image_prompt}")
             replied = True
 
         elif reply.startswith("CODE:"):
@@ -455,6 +492,7 @@ async def on_message(message):
             log("NOVA", f"[CODE] {language}", "BOT")
             await send_once(message.channel, final)
             conversation_history[user_id].append({"role": "assistant", "content": reply})
+            sync_message(user_id, "assistant", reply)
             replied = True
 
         elif reply.startswith("MATH:"):
@@ -462,6 +500,7 @@ async def on_message(message):
             log("NOVA", "[MATH]", "BOT")
             await send_once(message.channel, f"🧮 **Math Solution**\n{content}")
             conversation_history[user_id].append({"role": "assistant", "content": reply})
+            sync_message(user_id, "assistant", reply)
             replied = True
 
         elif reply.startswith("MUSIC:"):
@@ -469,6 +508,7 @@ async def on_message(message):
             log("NOVA", "[MUSIC]", "BOT")
             await send_once(message.channel, f"🎵 **Nova's Playlist**\n{content}")
             conversation_history[user_id].append({"role": "assistant", "content": reply})
+            sync_message(user_id, "assistant", reply)
             replied = True
 
         elif reply.startswith("ROAST:"):
@@ -476,6 +516,7 @@ async def on_message(message):
             log("NOVA", "[ROAST]", "BOT")
             await send_once(message.channel, f"🔥 **Nova roasts...**\n{content}")
             conversation_history[user_id].append({"role": "assistant", "content": reply})
+            sync_message(user_id, "assistant", reply)
             replied = True
 
         elif reply.startswith("JOKE:"):
@@ -483,6 +524,7 @@ async def on_message(message):
             log("NOVA", "[JOKE]", "BOT")
             await send_once(message.channel, f"😂 {content}")
             conversation_history[user_id].append({"role": "assistant", "content": reply})
+            sync_message(user_id, "assistant", reply)
             replied = True
 
         elif reply.startswith("RECIPE:"):
@@ -490,6 +532,7 @@ async def on_message(message):
             log("NOVA", "[RECIPE]", "BOT")
             await send_once(message.channel, f"🍳 **Recipe**\n{content}")
             conversation_history[user_id].append({"role": "assistant", "content": reply})
+            sync_message(user_id, "assistant", reply)
             replied = True
 
         elif reply.startswith("TRANSLATE:"):
@@ -497,6 +540,7 @@ async def on_message(message):
             log("NOVA", "[TRANSLATE]", "BOT")
             await send_once(message.channel, f"🌍 **Translation**\n{content}")
             conversation_history[user_id].append({"role": "assistant", "content": reply})
+            sync_message(user_id, "assistant", reply)
             replied = True
 
         elif reply.startswith("ADVICE:"):
@@ -504,6 +548,7 @@ async def on_message(message):
             log("NOVA", "[ADVICE]", "BOT")
             await send_once(message.channel, f"💡 **Nova's Advice**\n{content}")
             conversation_history[user_id].append({"role": "assistant", "content": reply})
+            sync_message(user_id, "assistant", reply)
             replied = True
 
         elif reply.startswith("STORY:"):
@@ -511,12 +556,14 @@ async def on_message(message):
             log("NOVA", "[STORY]", "BOT")
             await send_once(message.channel, f"📖 **Nova's Story**\n{content}")
             conversation_history[user_id].append({"role": "assistant", "content": reply})
+            sync_message(user_id, "assistant", reply)
             replied = True
 
         if not replied:
             log("NOVA", reply, "BOT")
             await send_once(message.channel, reply)
             conversation_history[user_id].append({"role": "assistant", "content": reply})
+            sync_message(user_id, "assistant", reply)
 
         save_conversation(user_id, username, conversation_history[user_id])
         print("-" * 50)
